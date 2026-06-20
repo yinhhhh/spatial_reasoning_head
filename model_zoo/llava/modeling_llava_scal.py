@@ -353,6 +353,16 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
         weight: Optional[float] = None,
         pos: Optional[torch.Tensor] = None,
         adjust_method: Optional[str] = None,
+        layer_weights: Optional[List[float]] = None,
+        head_weights: Optional[List[float]] = None,
+        head_apply_layers: Optional[str] = None,
+        active_head_mask: Optional[List[float]] = None,
+        enable_nonsquare_scaling: bool = False,
+        text_attn_scale: float = 1.0,
+        image_attn_scale: float = 1.0,
+        object_attn_scale: float = 1.0,
+        top_flat_fraction: float = 0.0,
+        top_flat_mix: float = 0.0,
         caption_length: Optional[list] = None,
     ) -> Union[Tuple, LlavaCausalLMOutputWithPast]:
         r"""
@@ -462,6 +472,16 @@ class LlavaForConditionalGenerationScal(LlavaPreTrainedModel):
             weight=weight,
             pos=pos,
             adjust_method=adjust_method,
+            layer_weights=layer_weights,
+            head_weights=head_weights,
+            head_apply_layers=head_apply_layers,
+            active_head_mask=active_head_mask,
+            enable_nonsquare_scaling=enable_nonsquare_scaling,
+            text_attn_scale=text_attn_scale,
+            image_attn_scale=image_attn_scale,
+            object_attn_scale=object_attn_scale,
+            top_flat_fraction=top_flat_fraction,
+            top_flat_mix=top_flat_mix,
             caption_length=caption_length,
         )
         

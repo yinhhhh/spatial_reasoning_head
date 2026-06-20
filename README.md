@@ -21,7 +21,7 @@ This code is based on the code of, **What's "up" with vision-language models? In
 git clone https://github.com/shiqichen17/AdaptVis.git
 mkdir data
 mkdir output
-pip install requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Downloading the data
