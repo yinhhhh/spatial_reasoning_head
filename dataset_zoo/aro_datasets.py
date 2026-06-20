@@ -258,7 +258,21 @@ class Controlled_Images(Dataset):
 
 
 
-    def evaluate_scores(self, scores,path,dataset,model,method,weight,sampled_indices,option):
+    def evaluate_scores(
+        self,
+        scores,
+        path,
+        dataset,
+        model,
+        method,
+        weight,
+        sampled_indices,
+        option,
+        weight1=None,
+        weight2=None,
+        threshold=None,
+        uncertainty_criterion=None,
+    ):
         """
         Scores: N x 1 x 4, i.e. first caption is right, next three captions are wrong
         """
@@ -329,7 +343,21 @@ class Controlled_Images(Dataset):
             })
         import json
         path_=os.path.join(path, 'res.json')
-        data = {"dataset":dataset, "model":model,"option":option,"method":method,"weight":weight, "Individual accuracy":metrics['Accuracy']*100,"Pair accuracy":pair_accuracy,"Set accuracy":set_accuracy,"correct_id":correct_id}
+        data = {
+            "dataset": dataset,
+            "model": model,
+            "option": option,
+            "method": method,
+            "weight": weight,
+            "weight1": weight1,
+            "weight2": weight2,
+            "threshold": threshold,
+            "uncertainty_criterion": uncertainty_criterion,
+            "Individual accuracy": metrics['Accuracy'] * 100,
+            "Pair accuracy": pair_accuracy,
+            "Set accuracy": set_accuracy,
+            "correct_id": correct_id,
+        }
         with open(path_, 'a+') as file:
             json.dump(data, file)
             file.write('\n')

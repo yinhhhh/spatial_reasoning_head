@@ -81,6 +81,168 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
+def _parse_smooth_layer_range(adjust_method: Optional[str]) -> Optional[Tuple[int, int]]:
+    """
+    Parse smooth layer range from:
+    - "smooth:14-31"
+    - "smooth_14_31"
+    """
+    if not adjust_method:
+        return None
+    method = adjust_method.strip().lower()
+    if method in {"none", "default"}:
+        return None
+
+    if method.startswith("smooth:"):
+        spec = method.split(":", 1)[1]
+        if "-" not in spec:
+            return None
+        start_str, end_str = spec.split("-", 1)
+    elif method.startswith("smooth_"):
+        parts = method.split("_")
+        if len(parts) != 3:
+            return None
+        _, start_str, end_str = parts
+    else:
+        return None
+
+    try:
+        start = int(start_str)
+        end = int(end_str)
+    except ValueError:
+        return None
+    if start > end:
+        start, end = end, start
+    return start, end
+
+
+def _apply_text_image_attention_scaling(
+    attn_weights: torch.Tensor,
+    image_mask: torch.Tensor,
+    text_mask: torch.Tensor,
+    image_attn_scale: float,
+    text_attn_scale: float,
+):
+    """Scale image/text attention logits on selected query rows."""
+    if image_attn_scale != 1.0:
+        attn_weights[:, :, image_mask] *= float(image_attn_scale)
+    if text_attn_scale != 1.0:
+        attn_weights[:, :, text_mask] *= float(text_attn_scale)
+
+
+def _load_env_yolo_patch_mask(expected_len: int, device) -> Optional[torch.Tensor]:
+    raw = os.getenv("YOLO_PATCH_MASK", "").strip()
+    if not raw:
+        return None
+    tokens = [t.strip() for t in raw.split(",") if t.strip() != ""]
+    if len(tokens) != int(expected_len):
+        return None
+    vals = [(tok == "1") for tok in tokens]
+    mask = torch.tensor(vals, dtype=torch.bool, device=device)
+    if mask.any():
+        return mask
+    return None
+
+
+def _apply_yolo_pull_after_softmax(
+    attn_weights: torch.Tensor,
+    keys: Optional[torch.Tensor],
+    caption_length: Optional[list],
+    active_head_mask: Optional[List[float]],
+):
+    if keys is None or attn_weights.size(-1) <= 0:
+        return attn_weights
+    try:
+        pull_ratio = float(os.getenv("YOLO_PULL_RATIO", "0"))
+    except ValueError:
+        pull_ratio = 0.0
+    if pull_ratio <= 0:
+        return attn_weights
+
+    true_indices = torch.where(keys)[True]
+    if len(true_indices) == 0:
+        return attn_weights
+    start_idx = int(true_indices[0].item())
+    end_idx = int(true_indices[-1].item()) + 1
+    seg_len = max(0, end_idx - start_idx)
+    if seg_len <= 0:
+        return attn_weights
+
+    yolo_patch_mask = _load_env_yolo_patch_mask(seg_len, attn_weights.device)
+    if yolo_patch_mask is None:
+        return attn_weights
+
+    image_start = max(0, start_idx)
+    image_end = min(attn_weights.size(-1), end_idx)
+    selected_keys = torch.arange(image_start, image_end, device=attn_weights.device)
+    keep_len = min(selected_keys.numel(), yolo_patch_mask.numel())
+    selected_keys = selected_keys[:keep_len][yolo_patch_mask[:keep_len]]
+    if selected_keys.numel() <= 0:
+        return attn_weights
+
+    if caption_length:
+        q_start = max(0, attn_weights.size(-2) - len(caption_length[0]))
+        q_rows = list(range(q_start, attn_weights.size(-2)))
+    else:
+        q_rows = [attn_weights.size(-2) - 1]
+
+    if active_head_mask is not None and len(active_head_mask) == attn_weights.size(1):
+        head_idx = [i for i, v in enumerate(active_head_mask) if float(v) > 0.5]
+        if not head_idx:
+            return attn_weights
+        head_idx_t = torch.tensor(head_idx, dtype=torch.long, device=attn_weights.device)
+    else:
+        head_idx_t = torch.arange(attn_weights.size(1), dtype=torch.long, device=attn_weights.device)
+
+    for q in q_rows:
+        row = attn_weights[:, :, q, :]  # [bsz, heads, kv]
+        row_sel = row.index_select(1, head_idx_t)  # [bsz, sel_heads, kv]
+        row_max = row_sel.max(dim=-1, keepdim=True).values
+        target = row_max * float(pull_ratio)
+        cur = row_sel[:, :, selected_keys]
+        row_sel[:, :, selected_keys] = torch.maximum(cur, target)
+        row[:, head_idx_t, :] = row_sel
+        row_sum = row.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        row = row / row_sum
+        attn_weights[:, :, q, :] = row
+
+    return attn_weights
+
+
+def _extract_key_indices(mask_like):
+    if mask_like is None:
+        return None
+    if isinstance(mask_like, list):
+        try:
+            mask_like = torch.stack(mask_like, dim=0)
+        except Exception:
+            return None
+    if not torch.is_tensor(mask_like):
+        return None
+    where_out = torch.where(mask_like)
+    if len(where_out) == 0:
+        return None
+    indices = where_out[-1]
+    if len(indices) == 0:
+        return None
+    return indices
+
+
+def _in_layer_span(layer_idx: Optional[int], layer_span: Optional[str]) -> bool:
+    if layer_idx is None:
+        return False
+    if not layer_span:
+        return False
+    try:
+        left_s, right_s = layer_span.split("-", 1)
+        left, right = int(left_s.strip()), int(right_s.strip())
+    except (ValueError, AttributeError):
+        return False
+    if left > right:
+        left, right = right, left
+    return left <= layer_idx <= right
+
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -228,7 +390,17 @@ class LLaMAAttention(nn.Module):
         pos: Optional[torch.Tensor] = None,
         idx: Optional[int] = None,
         caption_length: Optional[list] = None,
-        adjust_method: Optional[str] = None
+        adjust_method: Optional[str] = None,
+        layer_weights: Optional[List[float]] = None,
+        head_weights: Optional[List[float]] = None,
+        head_apply_layers: Optional[str] = None,
+        active_head_mask: Optional[List[float]] = None,
+        enable_nonsquare_scaling: bool = False,
+        text_attn_scale: float = 1.0,
+        image_attn_scale: float = 1.0,
+        object_attn_scale: float = 1.0,
+        top_flat_fraction: float = 0.0,
+        top_flat_mix: float = 0.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -266,29 +438,197 @@ class LLaMAAttention(nn.Module):
         unchanged_attn_weights = attn_weights.clone()
 
         ######ATTENTION#######
+        effective_weight = weight
+        if layer_weights is not None and idx is not None and 0 <= idx < len(layer_weights):
+            effective_weight = float(layer_weights[idx])
+        else:
+            smooth_range = _parse_smooth_layer_range(adjust_method)
+            if smooth_range is not None and idx is not None and weight is not None:
+                start_layer, end_layer = smooth_range
+                if idx < start_layer or idx > end_layer:
+                    effective_weight = 1.0
+                else:
+                    denom = max(1, end_layer - start_layer)
+                    progress = float(idx - start_layer) / float(denom)
+                    effective_weight = 1.0 + (weight - 1.0) * progress
+
         if idx<32:
             if attn_weights.size()[2]==attn_weights.size()[3]:
-                true_indices = torch.where(keys)[True]
-                if len(true_indices) == 0:
-                    print("No True values found in index.")
+                if keys is None:
+                    start_idx,end_idx,square_size = -1,-1,-1
                 else:
-                    # pdb.set_trace()
-                    start_idx = true_indices[0].item()
-                    end_idx = true_indices[-1].item()
-                    square_size = end_idx - start_idx + 1
-                    mask = torch.zeros((attn_weights.size()[2], attn_weights.size()[2]), dtype=torch.bool)
-                    if caption_length:
-                        mask[-len(caption_length[0]):,start_idx:start_idx + square_size+1] = True
+                    true_indices = torch.where(keys)[True]
+                    if len(true_indices) == 0:
+                        print("No True values found in index.")
                     else:
-                        mask[-1,start_idx:start_idx + square_size] = True
-                        # mask[start_idx:start_idx + square_size,start_idx:start_idx + square_size] = True
-                    # pdb.set_trace()
-                    # pdb.set_trace()
-                    attn_weights[:, :, mask] *= weight
+                        # pdb.set_trace()
+                        start_idx = true_indices[0].item()
+                        end_idx = true_indices[-1].item()
+                        square_size = end_idx - start_idx + 1
+                        yolo_patch_mask = _load_env_yolo_patch_mask(square_size, attn_weights.device)
+                        image_start = max(0, start_idx)
+                        image_end = min(attn_weights.size()[3], start_idx + square_size)
+                        selected_keys = torch.arange(image_start, image_end, device=attn_weights.device)
+                        if yolo_patch_mask is not None:
+                            keep_len = min(selected_keys.numel(), yolo_patch_mask.numel())
+                            selected_keys = selected_keys[:keep_len][yolo_patch_mask[:keep_len]]
+                        mask = torch.zeros(
+                            (attn_weights.size()[2], attn_weights.size()[2]),
+                            dtype=torch.bool,
+                            device=attn_weights.device,
+                        )
+                        if caption_length:
+                            if selected_keys.numel() > 0:
+                                mask[-len(caption_length[0]):, selected_keys] = True
+                        else:
+                            if selected_keys.numel() > 0:
+                                mask[-1, selected_keys] = True
+                            # mask[start_idx:start_idx + square_size,start_idx:start_idx + square_size] = True
+                        # pdb.set_trace()
+                        # pdb.set_trace()
+                        if active_head_mask is not None and len(active_head_mask) == self.num_heads:
+                            eff = float(effective_weight) if effective_weight is not None else 1.0
+                            active_scale = torch.tensor(
+                                active_head_mask,
+                                dtype=attn_weights.dtype,
+                                device=attn_weights.device,
+                            ).view(1, self.num_heads, 1)
+                            # Selected heads get effective_weight; others stay at 1.0.
+                            head_scale = 1.0 + (eff - 1.0) * active_scale
+                            attn_weights[:, :, mask] = attn_weights[:, :, mask] * head_scale
+                        else:
+                            attn_weights[:, :, mask] *= effective_weight
+                        if (
+                            head_weights is not None
+                            and len(head_weights) == self.num_heads
+                            and _in_layer_span(idx, head_apply_layers)
+                        ):
+                            head_scale = torch.tensor(
+                                head_weights,
+                                dtype=attn_weights.dtype,
+                                device=attn_weights.device,
+                            ).view(1, self.num_heads, 1)
+                            attn_weights[:, :, mask] = attn_weights[:, :, mask] * head_scale
+                        if text_attn_scale != 1.0 or image_attn_scale != 1.0:
+                            if caption_length:
+                                q_start = max(0, attn_weights.size()[2] - len(caption_length[0]))
+                                q_end = attn_weights.size()[2]
+                            else:
+                                q_start = max(0, attn_weights.size()[2] - 1)
+                                q_end = attn_weights.size()[2]
+                            if image_end > image_start and q_end > q_start:
+                                ratio_image_mask = torch.zeros(
+                                    (attn_weights.size()[2], attn_weights.size()[3]),
+                                    dtype=torch.bool,
+                                    device=attn_weights.device,
+                                )
+                                if selected_keys.numel() > 0:
+                                    ratio_image_mask[q_start:q_end, selected_keys] = True
+                                ratio_text_mask = torch.zeros_like(ratio_image_mask)
+                                ratio_text_mask[q_start:q_end, :] = True
+                                if selected_keys.numel() > 0:
+                                    ratio_text_mask[q_start:q_end, selected_keys] = False
+                                _apply_text_image_attention_scaling(
+                                    attn_weights,
+                                    ratio_image_mask,
+                                    ratio_text_mask,
+                                    image_attn_scale=image_attn_scale,
+                                    text_attn_scale=text_attn_scale,
+                                )
+                        if object_attn_scale != 1.0 and pos is not None:
+                            obj_indices = _extract_key_indices(pos)
+                            if obj_indices is not None and len(obj_indices) > 0:
+                                if caption_length:
+                                    q_start = max(0, attn_weights.size()[2] - len(caption_length[0]))
+                                    q_end = attn_weights.size()[2]
+                                else:
+                                    q_start = max(0, attn_weights.size()[2] - 1)
+                                    q_end = attn_weights.size()[2]
+                                obj_start = int(obj_indices[0].item())
+                                obj_end = int(obj_indices[-1].item()) + 1
+                                obj_start = max(0, obj_start)
+                                obj_end = min(attn_weights.size()[3], obj_end)
+                                if q_end > q_start and obj_end > obj_start:
+                                    obj_mask = torch.zeros(
+                                        (attn_weights.size()[2], attn_weights.size()[3]),
+                                        dtype=torch.bool,
+                                        device=attn_weights.device,
+                                    )
+                                    obj_mask[q_start:q_end, obj_start:obj_end] = True
+                                    attn_weights[:, :, obj_mask] *= float(object_attn_scale)
                     
             else:
-                # print("Not a square matrix, skipping. got size", attn_weights.size())
                 start_idx,end_idx,square_size = -1,-1,-1
+                if enable_nonsquare_scaling and keys is not None:
+                    true_indices = torch.where(keys)[True]
+                    if len(true_indices) > 0:
+                        start_idx = true_indices[0].item()
+                        end_idx = true_indices[-1].item()
+                        square_size = end_idx - start_idx + 1
+                        yolo_patch_mask = _load_env_yolo_patch_mask(square_size, attn_weights.device)
+                        image_start = max(0, start_idx)
+                        image_end = min(attn_weights.size()[3], start_idx + square_size)
+                        selected_keys = torch.arange(image_start, image_end, device=attn_weights.device)
+                        if yolo_patch_mask is not None:
+                            keep_len = min(selected_keys.numel(), yolo_patch_mask.numel())
+                            selected_keys = selected_keys[:keep_len][yolo_patch_mask[:keep_len]]
+                        # Non-square decode: scale current query row over image-token key span.
+                        row_mask = torch.zeros(
+                            (attn_weights.size()[2], attn_weights.size()[3]),
+                            dtype=torch.bool,
+                            device=attn_weights.device,
+                        )
+                        if selected_keys.numel() > 0:
+                            row_mask[-1, selected_keys] = True
+                        if active_head_mask is not None and len(active_head_mask) == self.num_heads:
+                            eff = float(effective_weight) if effective_weight is not None else 1.0
+                            active_scale = torch.tensor(
+                                active_head_mask,
+                                dtype=attn_weights.dtype,
+                                device=attn_weights.device,
+                            ).view(1, self.num_heads, 1)
+                            head_scale = 1.0 + (eff - 1.0) * active_scale
+                            attn_weights[:, :, row_mask] = attn_weights[:, :, row_mask] * head_scale
+                        else:
+                            attn_weights[:, :, row_mask] *= effective_weight
+                        if (
+                            head_weights is not None
+                            and len(head_weights) == self.num_heads
+                            and _in_layer_span(idx, head_apply_layers)
+                        ):
+                            head_scale = torch.tensor(
+                                head_weights,
+                                dtype=attn_weights.dtype,
+                                device=attn_weights.device,
+                            ).view(1, self.num_heads, 1)
+                            attn_weights[:, :, row_mask] = attn_weights[:, :, row_mask] * head_scale
+                        if text_attn_scale != 1.0 or image_attn_scale != 1.0:
+                            if image_end > image_start:
+                                ratio_image_mask = torch.zeros_like(row_mask)
+                                if selected_keys.numel() > 0:
+                                    ratio_image_mask[-1, selected_keys] = True
+                                ratio_text_mask = torch.zeros_like(row_mask)
+                                ratio_text_mask[-1, :] = True
+                                if selected_keys.numel() > 0:
+                                    ratio_text_mask[-1, selected_keys] = False
+                                _apply_text_image_attention_scaling(
+                                    attn_weights,
+                                    ratio_image_mask,
+                                    ratio_text_mask,
+                                    image_attn_scale=image_attn_scale,
+                                    text_attn_scale=text_attn_scale,
+                                )
+                        if object_attn_scale != 1.0 and pos is not None:
+                            obj_indices = _extract_key_indices(pos)
+                            if obj_indices is not None and len(obj_indices) > 0:
+                                obj_start = int(obj_indices[0].item())
+                                obj_end = int(obj_indices[-1].item()) + 1
+                                obj_start = max(0, obj_start)
+                                obj_end = min(attn_weights.size()[3], obj_end)
+                                if obj_end > obj_start:
+                                    obj_mask = torch.zeros_like(row_mask)
+                                    obj_mask[-1, obj_start:obj_end] = True
+                                    attn_weights[:, :, obj_mask] *= float(object_attn_scale)
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -300,16 +640,53 @@ class LLaMAAttention(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = _apply_yolo_pull_after_softmax(
+            attn_weights=attn_weights,
+            keys=keys,
+            caption_length=caption_length,
+            active_head_mask=active_head_mask,
+        )
+        # Optional: flatten top-fraction image-token attention values toward local max (per head/query row).
+        if top_flat_fraction > 0.0 and keys is not None and attn_weights.size(-1) > 0:
+            true_indices = torch.where(keys)[True]
+            if len(true_indices) > 0:
+                start_idx = int(true_indices[0].item())
+                end_idx = int(true_indices[-1].item()) + 1
+                start_idx = max(0, start_idx)
+                end_idx = min(attn_weights.size(-1), end_idx)
+                if end_idx > start_idx:
+                    q_rows = [attn_weights.size(-2) - 1]
+                    if caption_length:
+                        q_rows = list(range(max(0, attn_weights.size(-2) - len(caption_length[0])), attn_weights.size(-2)))
+                    frac = float(max(0.0, min(1.0, top_flat_fraction)))
+                    mix = float(max(0.0, min(1.0, top_flat_mix)))
+                    if frac > 0.0 and mix > 0.0:
+                        seg_len = end_idx - start_idx
+                        topk = max(1, int(round(seg_len * frac)))
+                        for q in q_rows:
+                            seg = attn_weights[:, :, q, start_idx:end_idx]  # [bsz, heads, seg_len]
+                            vals, idxs = torch.topk(seg, k=topk, dim=-1)
+                            maxv = vals[..., :1]
+                            boosted = vals + mix * (maxv - vals)
+                            seg.scatter_(-1, idxs, boosted)
+                            attn_weights[:, :, q, start_idx:end_idx] = seg
+                        # Re-normalize probabilities on modified query rows.
+                        for q in q_rows:
+                            row_sum = attn_weights[:, :, q, :].sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                            attn_weights[:, :, q, :] = attn_weights[:, :, q, :] / row_sum
         if SAVE_ATTN : # save the change in attention weights for analysis
             save_path = os.getenv("SAVE_ATTN_PATH")
             if not save_path:
                 raise ValueError("SAVE_ATTN_PATH not set.")
             unchanged_attn_weights = unchanged_attn_weights + attention_mask
             unchanged_attn_weights = torch.max(unchanged_attn_weights, torch.tensor(torch.finfo(unchanged_attn_weights.dtype).min))
-            if SAVE_ORI:
-                ori=unchanged_attn_weights[:,:,-1,:]
-                # pdb.set_trace()
-                np.save(f"{save_path}diff_{idx}_start{start_idx}_end{end_idx}.npy", ori.cpu().detach().numpy())
+            save_source = os.getenv("SAVE_ATTN_SOURCE", "modified").strip().lower()
+            if save_source == "raw":
+                to_save = unchanged_attn_weights[:, :, -1, :]
+            else:
+                # Save post-intervention attention probabilities for overlap analysis.
+                to_save = attn_weights[:, :, -1, :]
+            np.save(f"{save_path}diff_{idx}_start{start_idx}_end{end_idx}.npy", to_save.cpu().detach().numpy())
 
             unchanged_attn_weights = nn.functional.softmax(unchanged_attn_weights, dim=-1, dtype=torch.float32).to(
                 query_states.dtype)
@@ -366,6 +743,16 @@ class LLaMADecoderLayer(nn.Module):
         idx: Optional[int] = None,
         caption_length: Optional[list] = None,
         adjust_method: Optional[str] = None,
+        layer_weights: Optional[List[float]] = None,
+        head_weights: Optional[List[float]] = None,
+        head_apply_layers: Optional[str] = None,
+        active_head_mask: Optional[List[float]] = None,
+        enable_nonsquare_scaling: bool = False,
+        text_attn_scale: float = 1.0,
+        image_attn_scale: float = 1.0,
+        object_attn_scale: float = 1.0,
+        top_flat_fraction: float = 0.0,
+        top_flat_mix: float = 0.0,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -397,6 +784,16 @@ class LLaMADecoderLayer(nn.Module):
             idx=idx,
             caption_length=caption_length,
             adjust_method=adjust_method,
+            layer_weights=layer_weights,
+            head_weights=head_weights,
+            head_apply_layers=head_apply_layers,
+            active_head_mask=active_head_mask,
+            enable_nonsquare_scaling=enable_nonsquare_scaling,
+            text_attn_scale=text_attn_scale,
+            image_attn_scale=image_attn_scale,
+            object_attn_scale=object_attn_scale,
+            top_flat_fraction=top_flat_fraction,
+            top_flat_mix=top_flat_mix,
         )
         
         hidden_states = residual + hidden_states
@@ -589,6 +986,16 @@ class LLaMAModel(LLaMAPreTrainedModel):
         weight: Optional[float] = None,
         caption_length: Optional[list] = None,
         adjust_method: Optional[str]=None,
+        layer_weights: Optional[List[float]] = None,
+        head_weights: Optional[List[float]] = None,
+        head_apply_layers: Optional[str] = None,
+        active_head_mask: Optional[List[float]] = None,
+        enable_nonsquare_scaling: bool = False,
+        text_attn_scale: float = 1.0,
+        image_attn_scale: float = 1.0,
+        object_attn_scale: float = 1.0,
+        top_flat_fraction: float = 0.0,
+        top_flat_mix: float = 0.0,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
         Args:
@@ -716,7 +1123,17 @@ class LLaMAModel(LLaMAPreTrainedModel):
                     pos=pos,
                     idx=idx,
                     caption_length=caption_length,
-                    adjust_method=adjust_method
+                    adjust_method=adjust_method,
+                    layer_weights=layer_weights,
+                    head_weights=head_weights,
+                    head_apply_layers=head_apply_layers,
+                    active_head_mask=active_head_mask,
+                    enable_nonsquare_scaling=enable_nonsquare_scaling,
+                    text_attn_scale=text_attn_scale,
+                    image_attn_scale=image_attn_scale,
+                    object_attn_scale=object_attn_scale,
+                    top_flat_fraction=top_flat_fraction,
+                    top_flat_mix=top_flat_mix,
                 )
             
             hidden_states = layer_outputs[0]
@@ -792,6 +1209,16 @@ class LLaMAForCausalLMScal(LLaMAPreTrainedModel):
         weight: Optional[float] = None,
         caption_length: Optional[list] = None,
         adjust_method: Optional[str]=None,
+        layer_weights: Optional[List[float]] = None,
+        head_weights: Optional[List[float]] = None,
+        head_apply_layers: Optional[str] = None,
+        active_head_mask: Optional[List[float]] = None,
+        enable_nonsquare_scaling: bool = False,
+        text_attn_scale: float = 1.0,
+        image_attn_scale: float = 1.0,
+        object_attn_scale: float = 1.0,
+        top_flat_fraction: float = 0.0,
+        top_flat_mix: float = 0.0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -882,7 +1309,17 @@ class LLaMAForCausalLMScal(LLaMAPreTrainedModel):
             pos=pos,
             weight=weight,
             caption_length=caption_length,
-            adjust_method=adjust_method
+            adjust_method=adjust_method,
+            layer_weights=layer_weights,
+            head_weights=head_weights,
+            head_apply_layers=head_apply_layers,
+            active_head_mask=active_head_mask,
+            enable_nonsquare_scaling=enable_nonsquare_scaling,
+            text_attn_scale=text_attn_scale,
+            image_attn_scale=image_attn_scale,
+            object_attn_scale=object_attn_scale,
+            top_flat_fraction=top_flat_fraction,
+            top_flat_mix=top_flat_mix,
         )
 
         hidden_states = outputs[0]

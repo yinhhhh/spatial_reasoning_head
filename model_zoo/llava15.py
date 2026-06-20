@@ -16,6 +16,7 @@ import requests
 import json
 import os
 from collections import Counter
+import re
 # from model_zoo.utils import normalize_answer,chat_completion_request,run_conversation
 
 from PIL import Image
@@ -48,6 +49,321 @@ import random
 import numpy as np
 import torch
 from tqdm import tqdm
+
+
+def _compute_uncertainty(scores_steps, criterion="max_prob", token_window=1, token_agg="mean"):
+    if isinstance(scores_steps, torch.Tensor):
+        step_tensors = [scores_steps]
+    else:
+        step_tensors = list(scores_steps)
+    if len(step_tensors) == 0:
+        return 0.0
+
+    use_steps = step_tensors[: max(1, min(token_window, len(step_tensors)))]
+    vals = []
+    for step_scores in use_steps:
+        probs = torch.nn.functional.softmax(step_scores, dim=-1)[0]
+        top2_vals, _ = torch.topk(probs, 2)
+        if criterion == "margin":
+            vals.append(float(top2_vals[0] - top2_vals[1]))
+        else:
+            vals.append(float(top2_vals[0]))
+
+    if token_agg == "mean":
+        return np.round(float(np.mean(vals)), 4)
+    return np.round(float(np.mean(vals)), 4)
+
+
+def _compute_top2_margin_stats(scores_steps, token_window=1, token_agg="mean"):
+    if isinstance(scores_steps, torch.Tensor):
+        step_tensors = [scores_steps]
+    else:
+        step_tensors = list(scores_steps)
+    if len(step_tensors) == 0:
+        return {"top1": 0.0, "top2": 0.0, "margin": 0.0}
+
+    use_steps = step_tensors[: max(1, min(token_window, len(step_tensors)))]
+    top1_vals = []
+    top2_vals = []
+    margin_vals = []
+    for step_scores in use_steps:
+        probs = torch.nn.functional.softmax(step_scores, dim=-1)[0]
+        top2, _ = torch.topk(probs, 2)
+        t1 = float(top2[0])
+        t2 = float(top2[1])
+        top1_vals.append(t1)
+        top2_vals.append(t2)
+        margin_vals.append(t1 - t2)
+
+    # Only mean is currently used, keep behavior explicit.
+    if token_agg == "mean":
+        top1 = float(np.mean(top1_vals))
+        top2 = float(np.mean(top2_vals))
+        margin = float(np.mean(margin_vals))
+    else:
+        top1 = float(np.mean(top1_vals))
+        top2 = float(np.mean(top2_vals))
+        margin = float(np.mean(margin_vals))
+
+    return {
+        "top1": np.round(top1, 4),
+        "top2": np.round(top2, 4),
+        "margin": np.round(margin, 4),
+    }
+
+
+def _continuous_weight(
+    uncertainty,
+    threshold,
+    weight1,
+    weight2,
+    mode="hard",
+    alpha=12.0,
+    span=0.1,
+):
+    if mode == "hard":
+        return weight1 if uncertainty < threshold else weight2
+
+    if mode == "linear":
+        lo = threshold - max(span, 1e-6)
+        hi = threshold + max(span, 1e-6)
+        if uncertainty <= lo:
+            t = 0.0
+        elif uncertainty >= hi:
+            t = 1.0
+        else:
+            t = (uncertainty - lo) / (hi - lo)
+        return weight1 + (weight2 - weight1) * t
+
+    # sigmoid
+    t = 1.0 / (1.0 + np.exp(-alpha * (uncertainty - threshold)))
+    return weight1 + (weight2 - weight1) * float(t)
+
+
+def _parse_region_config(region_config: str):
+    """
+    Parse per-region config string:
+    "1-13:w1,w2,th;14-25:w1,w2,th;26-31:w1,w2,th"
+    """
+    if not region_config or not region_config.strip():
+        return []
+
+    parsed = []
+    chunks = [chunk.strip() for chunk in region_config.split(";") if chunk.strip()]
+    for chunk in chunks:
+        if ":" not in chunk:
+            continue
+        layer_span, vals = chunk.split(":", 1)
+        if "-" not in layer_span:
+            continue
+        start_str, end_str = layer_span.split("-", 1)
+        triplet = [v.strip() for v in vals.split(",")]
+        if len(triplet) != 3:
+            continue
+        try:
+            start = int(start_str)
+            end = int(end_str)
+            w1 = float(triplet[0])
+            w2 = float(triplet[1])
+            th = float(triplet[2])
+        except ValueError:
+            continue
+        if start > end:
+            start, end = end, start
+        parsed.append({"start": start, "end": end, "w1": w1, "w2": w2, "th": th})
+    return parsed
+
+
+def _parse_layer_span(span_text: str):
+    try:
+        left, right = span_text.split("-", 1)
+        a, b = int(left.strip()), int(right.strip())
+    except (ValueError, AttributeError):
+        return None
+    if a > b:
+        a, b = b, a
+    return a, b
+
+
+def _parse_random_range(range_text: str, fallback_low: float, fallback_high: float):
+    try:
+        low_s, high_s = range_text.split(",", 1)
+        low, high = float(low_s.strip()), float(high_s.strip())
+    except (ValueError, AttributeError):
+        low, high = fallback_low, fallback_high
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def _build_region_layer_weights(
+    region_config: str,
+    uncertainty: float,
+    layer_count: int = 32,
+    low_random_th: float = -1.0,
+    random_mid_layers: str = "14-25",
+    random_late_layers: str = "26-31",
+    random_mid_range: str = "0.02,0.12",
+    random_late_range: str = "0.01,0.08",
+):
+    segments = _parse_region_config(region_config)
+    if not segments:
+        return None
+    layer_weights = [1.0] * layer_count
+    for seg in segments:
+        w = seg["w1"] if uncertainty < seg["th"] else seg["w2"]
+        left = max(0, seg["start"])
+        right = min(layer_count - 1, seg["end"])
+        for i in range(left, right + 1):
+            layer_weights[i] = float(w)
+
+    if low_random_th >= 0.0 and uncertainty < low_random_th:
+        mid_span = _parse_layer_span(random_mid_layers)
+        late_span = _parse_layer_span(random_late_layers)
+        mid_lo, mid_hi = _parse_random_range(random_mid_range, 0.02, 0.12)
+        late_lo, late_hi = _parse_random_range(random_late_range, 0.01, 0.08)
+
+        if mid_span is not None:
+            left = max(0, mid_span[0])
+            right = min(layer_count - 1, mid_span[1])
+            for i in range(left, right + 1):
+                layer_weights[i] = float(np.random.uniform(mid_lo, mid_hi))
+
+        if late_span is not None:
+            left = max(0, late_span[0])
+            right = min(layer_count - 1, late_span[1])
+            for i in range(left, right + 1):
+                layer_weights[i] = float(np.random.uniform(late_lo, late_hi))
+    return layer_weights
+
+
+def _build_head_weights(num_heads: int, ablate_head: int = -1, ablate_weight: float = 0.05):
+    if ablate_head < 0 or ablate_head >= num_heads:
+        return None
+    vals = [1.0] * num_heads
+    vals[int(ablate_head)] = float(ablate_weight)
+    return vals
+
+
+def _parse_active_heads(active_heads: str, num_heads: int = 32):
+    if not active_heads or not active_heads.strip():
+        return None
+    mask = [0.0] * num_heads
+    for token in active_heads.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            idx = int(token)
+        except ValueError:
+            continue
+        if 0 <= idx < num_heads:
+            mask[idx] = 1.0
+    if sum(mask) == 0:
+        return None
+    return mask
+
+
+_YOLO_MODEL_CACHE = {}
+
+
+def _get_yolo_model(model_path: str = "yolov8n.pt"):
+    if model_path not in _YOLO_MODEL_CACHE:
+        from ultralytics import YOLO
+
+        _YOLO_MODEL_CACHE[model_path] = YOLO(model_path)
+    return _YOLO_MODEL_CACHE[model_path]
+
+
+def _build_yolo_patch_mask_from_image(
+    image_pil,
+    conf: float = 0.15,
+    box_scale: float = 1.2,
+    require_single_box: bool = True,
+    patch_side: int = 24,
+):
+    model = _get_yolo_model("yolov8n.pt")
+    det = model.predict(source=image_pil, conf=conf, verbose=False)[0]
+    if det.boxes is None or len(det.boxes) == 0:
+        return None
+    if require_single_box and len(det.boxes) != 1:
+        return None
+    if len(det.boxes) > 1:
+        confs = det.boxes.conf.detach().cpu().numpy()
+        keep = int(np.argmax(confs))
+        box = det.boxes.xyxy.detach().cpu().numpy()[keep]
+    else:
+        box = det.boxes.xyxy.detach().cpu().numpy()[0]
+
+    img_w, img_h = image_pil.size
+    x1, y1, x2, y2 = box.tolist()
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    bw = max(1e-6, x2 - x1) * float(box_scale)
+    bh = max(1e-6, y2 - y1) * float(box_scale)
+    sx1 = max(0.0, cx - 0.5 * bw)
+    sy1 = max(0.0, cy - 0.5 * bh)
+    sx2 = min(float(img_w - 1), cx + 0.5 * bw)
+    sy2 = min(float(img_h - 1), cy + 0.5 * bh)
+
+    x_centers = (np.arange(patch_side) + 0.5) * (img_w / patch_side)
+    y_centers = (np.arange(patch_side) + 0.5) * (img_h / patch_side)
+    xv, yv = np.meshgrid(x_centers, y_centers)
+    mask = ((xv >= sx1) & (xv <= sx2) & (yv >= sy1) & (yv <= sy2)).astype(np.int32).reshape(-1)
+    if mask.sum() <= 0:
+        return None
+    return mask.tolist()
+
+
+def _extract_where_is_object(prompt: str) -> Optional[str]:
+    if not prompt:
+        return None
+    m = re.search(r"where\s+is\s+the\s+(.+?)\s+in\s+the\s+photo", prompt, flags=re.IGNORECASE)
+    if not m:
+        return None
+    phrase = m.group(1).strip(" .,:;!?")
+    return phrase if phrase else None
+
+
+def _find_subsequence_spans(sequence: List[int], pattern: List[int]) -> List[Tuple[int, int]]:
+    if not pattern or len(pattern) > len(sequence):
+        return []
+    spans = []
+    p_len = len(pattern)
+    for start in range(len(sequence) - p_len + 1):
+        if sequence[start : start + p_len] == pattern:
+            spans.append((start, start + p_len))
+    return spans
+
+
+def _build_object_token_mask(input_ids: torch.Tensor, tokenizer, prompt: str):
+    if tokenizer is None:
+        return None
+    phrase = _extract_where_is_object(prompt)
+    if phrase is None:
+        return None
+
+    seq = input_ids[0].tolist()
+    candidates = []
+    for text in [phrase, " " + phrase]:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if ids:
+            candidates.append(ids)
+    if not candidates:
+        return None
+
+    spans: List[Tuple[int, int]] = []
+    for cand in candidates:
+        spans.extend(_find_subsequence_spans(seq, cand))
+    if not spans:
+        return None
+
+    merged = [torch.zeros_like(row, dtype=torch.long) for row in input_ids]
+    for start, end in spans:
+        merged[0][start:end] = 1
+    return merged
+
+
 def _add_weight_greedy_search(
     self,
     input_ids: torch. LongTensor,
@@ -65,6 +381,16 @@ def _add_weight_greedy_search(
     # keys:Optional[torch.Tensor] = None,
     weight: Optional[float] = None,
     adjust_method: Optional[str] = None,
+    layer_weights: Optional[List[float]] = None,
+    head_weights: Optional[List[float]] = None,
+    head_apply_layers: Optional[str] = None,
+    active_head_mask: Optional[List[float]] = None,
+    enable_nonsquare_scaling: bool = False,
+    text_attn_scale: float = 1.0,
+    image_attn_scale: float = 1.0,
+    object_attn_scale: float = 1.0,
+    top_flat_fraction: float = 0.0,
+    top_flat_mix: float = 0.0,
     pos: Optional[torch.Tensor] = None,
     streamer: Optional["BaseStreamer"] = None,
     **model_kwargs,
@@ -139,6 +465,16 @@ def _add_weight_greedy_search(
                 **model_inputs,
                 weight=weight,
                 adjust_method=adjust_method,
+                layer_weights=layer_weights,
+                head_weights=head_weights,
+                head_apply_layers=head_apply_layers,
+                active_head_mask=active_head_mask,
+                enable_nonsquare_scaling=enable_nonsquare_scaling,
+                text_attn_scale=text_attn_scale,
+                image_attn_scale=image_attn_scale,
+                object_attn_scale=object_attn_scale,
+                top_flat_fraction=top_flat_fraction,
+                top_flat_mix=top_flat_mix,
                 pos=pos,
                 return_dict=True,
                 output_attentions=output_attentions,
@@ -284,7 +620,45 @@ class LlavaWrapper:
     
     
     @torch.no_grad()
-    def get_out_scores_wh_batched(self, dataset, joint_loader, method, weight, option, threshold, weight1, weight2):
+    def get_out_scores_wh_batched(
+        self,
+        dataset,
+        joint_loader,
+        method,
+        weight,
+        option,
+        threshold,
+        weight1,
+        weight2,
+        uncertainty_criterion="max_prob",
+        adapt_weighting="hard",
+        adapt_alpha=12.0,
+        adapt_span=0.1,
+        uncertainty_token_window=1,
+        uncertainty_token_agg="mean",
+        adjust_method="none",
+        region_config="",
+        low_random_th=-1.0,
+        random_mid_layers="14-25",
+        random_late_layers="26-31",
+        random_mid_range="0.02,0.12",
+        random_late_range="0.01,0.08",
+        ablate_head=-1,
+        ablate_head_weight=0.05,
+        ablate_head_layers="14-31",
+        active_heads="",
+        enable_nonsquare_scaling=False,
+        text_attn_scale=1.0,
+        image_attn_scale=1.0,
+        object_text_attn_scale=1.0,
+        top_flat_fraction=0.0,
+        top_flat_mix=0.0,
+        spatial_yolo_scale=1.0,
+        spatial_yolo_conf=0.15,
+        spatial_yolo_box_scale=1.2,
+        spatial_yolo_single_box_only=False,
+        spatial_yolo_pull_ratio=0.0,
+    ):
 
         
         scores = []  # To store scores for each batch
@@ -314,6 +688,7 @@ class LlavaWrapper:
         # Sampling configuration
         SAMPLE = True
         TEST = os.getenv('TEST_MODE', 'False') == 'True'
+        TEST_SAMPLE_COUNT = int(os.getenv('TEST_SAMPLE_COUNT', '80'))
         total_data_count = len(prompt_list)
         
         # Perform sampling if enabled
@@ -332,7 +707,7 @@ class LlavaWrapper:
                 all_indices = set(range(total_data_count))
                 unsampled_indices = list(all_indices - set(sampled_indices))
                 unsampled_indices.sort()
-                sampled_indices = unsampled_indices
+                sampled_indices = unsampled_indices[:min(TEST_SAMPLE_COUNT, len(unsampled_indices))]
 
             # Subset prompts and answers based on sampled indices
             prompt_list = [prompt_list[i] for i in sampled_indices]
@@ -341,6 +716,7 @@ class LlavaWrapper:
         # Create directory for saving attention maps
         save_attn_dir = f"./output/{dataset}_weight{weight:.2f}"
         os.makedirs(save_attn_dir, exist_ok=True)
+        active_head_mask = _parse_active_heads(active_heads, num_heads=32)
 
         results = []  # Store results for each generated sequence
         for batch in tqdm(joint_loader):
@@ -356,6 +732,23 @@ class LlavaWrapper:
                 
                 for _ in i_option:
                     prompt = prompt_list[index_of_total]
+                    yolo_patch_mask = None
+                    if float(spatial_yolo_scale) > 1.0 or float(spatial_yolo_pull_ratio) > 0.0:
+                        try:
+                            yolo_patch_mask = _build_yolo_patch_mask_from_image(
+                                image_pil=_,
+                                conf=float(spatial_yolo_conf),
+                                box_scale=float(spatial_yolo_box_scale),
+                                require_single_box=bool(spatial_yolo_single_box_only),
+                                patch_side=24,
+                            )
+                        except Exception:
+                            yolo_patch_mask = None
+                    if yolo_patch_mask is not None:
+                        os.environ["YOLO_PATCH_MASK"] = ",".join(str(int(v)) for v in yolo_patch_mask)
+                    else:
+                        os.environ["YOLO_PATCH_MASK"] = ""
+                    os.environ["YOLO_PULL_RATIO"] = str(float(spatial_yolo_pull_ratio))
                     
                     # Preprocess input for the model
                     single_input = self.processor(
@@ -364,47 +757,169 @@ class LlavaWrapper:
                     
                     # Create key mask for special token
                     keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
+                    object_keys = _build_object_token_mask(
+                        single_input["input_ids"],
+                        getattr(self.processor, "tokenizer", None),
+                        prompt,
+                    )
 
                     # Generate predictions based on specified method
+                    head_weights = _build_head_weights(32, ablate_head, ablate_head_weight)
                     if method == 'scaling_vis':
                         
                         change_greedy_to_add_weight()
                         output = self.model.generate(
                             **single_input, keys=keys, weight=weight,
+                            adjust_method=adjust_method,
+                            layer_weights=None,
+                            head_weights=head_weights,
+                            head_apply_layers=ablate_head_layers,
+                            active_head_mask=active_head_mask,
+                            enable_nonsquare_scaling=enable_nonsquare_scaling,
+                            text_attn_scale=text_attn_scale,
+                            image_attn_scale=image_attn_scale,
+                            pos=object_keys,
+                            object_attn_scale=object_text_attn_scale,
+                            top_flat_fraction=top_flat_fraction,
+                            top_flat_mix=top_flat_mix,
                             max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                         )
-                        uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
+                        uncertainty = _compute_uncertainty(
+                            output['scores'],
+                            "max_prob",
+                            token_window=uncertainty_token_window,
+                            token_agg=uncertainty_token_agg,
+                        )
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
                     
                     elif method == 'adapt_vis':
                         change_greedy_to_add_weight()
                        
                         output = self.model.generate(
-                            **single_input,weight=1.0,max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                            **single_input, weight=1.0, adjust_method=adjust_method,
+                            head_weights=head_weights,
+                            head_apply_layers=ablate_head_layers,
+                            active_head_mask=active_head_mask,
+                            enable_nonsquare_scaling=enable_nonsquare_scaling,
+                            text_attn_scale=text_attn_scale,
+                            image_attn_scale=image_attn_scale,
+                            pos=object_keys,
+                            object_attn_scale=object_text_attn_scale,
+                            top_flat_fraction=top_flat_fraction,
+                            top_flat_mix=top_flat_mix,
+                            max_new_tokens=100, output_scores=True, return_dict_in_generate=True
                         )
-                        uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
-                        print(uncertainty,threshold)
-
+                        uncertainty = _compute_uncertainty(
+                            output['scores'],
+                            uncertainty_criterion,
+                            token_window=uncertainty_token_window,
+                            token_agg=uncertainty_token_agg,
+                        )
+                        if os.getenv("LOG_TOP2_MARGIN", "0") == "1":
+                            _s = _compute_top2_margin_stats(
+                                output['scores'],
+                                token_window=uncertainty_token_window,
+                                token_agg=uncertainty_token_agg,
+                            )
+                            print(
+                                f"[top2_debug] top1={_s['top1']:.4f} top2={_s['top2']:.4f} margin={_s['margin']:.4f}"
+                            )
                         # Adjust attention based on uncertainty
-                        if uncertainty < threshold:
-                            output = self.model.generate(
-                                **single_input, keys=keys, weight=weight1, 
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                        adapt_weight = _continuous_weight(
+                            uncertainty,
+                            threshold,
+                            weight1,
+                            weight2,
+                            mode=adapt_weighting,
+                            alpha=adapt_alpha,
+                            span=adapt_span,
+                        )
+                        if os.getenv("LOG_ADAPT_WEIGHT", "0") == "1":
+                            print(
+                                f"[adapt_debug] uncertainty={uncertainty:.4f} "
+                                f"threshold={threshold:.4f} adapt_weight={adapt_weight:.6f}"
                             )
-                        else:
-                            output = self.model.generate(
-                                **single_input, keys=keys, weight=weight2, 
-                                max_new_tokens=100, output_scores=True, return_dict_in_generate=True
-                            )
+                        region_layer_weights = _build_region_layer_weights(
+                            region_config=region_config,
+                            uncertainty=uncertainty,
+                            layer_count=32,
+                            low_random_th=low_random_th,
+                            random_mid_layers=random_mid_layers,
+                            random_late_layers=random_late_layers,
+                            random_mid_range=random_mid_range,
+                            random_late_range=random_late_range,
+                        )
+                        spatial_scale = float(spatial_yolo_scale) if float(spatial_yolo_scale) > 1.0 else 1.0
+                        if spatial_scale > 1.0 and yolo_patch_mask is None:
+                            spatial_scale = 1.0
+                        output = self.model.generate(
+                            **single_input, keys=keys, weight=adapt_weight * spatial_scale,
+                            adjust_method=adjust_method,
+                            layer_weights=region_layer_weights,
+                            head_weights=head_weights,
+                            head_apply_layers=ablate_head_layers,
+                            active_head_mask=active_head_mask,
+                            enable_nonsquare_scaling=enable_nonsquare_scaling,
+                            text_attn_scale=text_attn_scale,
+                            image_attn_scale=image_attn_scale,
+                            pos=object_keys,
+                            object_attn_scale=object_text_attn_scale,
+                            top_flat_fraction=top_flat_fraction,
+                            top_flat_mix=top_flat_mix,
+                            max_new_tokens=100, output_scores=True, return_dict_in_generate=True
+                        )
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
 
                     else:
                         # Default generation method
-                        output = self.model.generate(
-                            **single_input, max_new_tokens=100, output_scores=True, return_dict_in_generate=True
-                        )
+                        supports_custom_attention = "Scal" in str(type(self.model))
+                        if supports_custom_attention and (text_attn_scale != 1.0 or image_attn_scale != 1.0):
+                            change_greedy_to_add_weight()
+                            output = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=1.0,
+                                adjust_method="none",
+                                layer_weights=None,
+                                head_weights=head_weights,
+                                head_apply_layers=ablate_head_layers,
+                                active_head_mask=active_head_mask,
+                                enable_nonsquare_scaling=enable_nonsquare_scaling,
+                                text_attn_scale=text_attn_scale,
+                                image_attn_scale=image_attn_scale,
+                                pos=object_keys,
+                                object_attn_scale=object_text_attn_scale,
+                                top_flat_fraction=top_flat_fraction,
+                                top_flat_mix=top_flat_mix,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+                        elif text_attn_scale != 1.0 or image_attn_scale != 1.0:
+                            print(
+                                "[warn] text/image attention scaling requested but current model "
+                                "does not support custom attention kwargs; falling back to default baseline."
+                            )
+                            output = self.model.generate(
+                                **single_input,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+                        else:
+                            output = self.model.generate(
+                                **single_input,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
                         gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True)
-                        uncertainty = np.round(float(max(output['scores'][0][0])), 2)
+                        uncertainty = _compute_uncertainty(
+                            output['scores'],
+                            "max_prob",
+                            token_window=uncertainty_token_window,
+                            token_agg=uncertainty_token_agg,
+                        )
 
                     # Print prompt, generated text, and expected answer
                     print(f"Prompt: {prompt}\nGeneration: {gen}\nGolden: {answer_list[index_of_total][0]}")
@@ -466,7 +981,39 @@ class LlavaWrapper:
     
     
     @torch.no_grad()
-    def get_judge_scores_vsr_batched(self, dataset, joint_loader, method, weight, threshold, weight1, weight2):
+    def get_judge_scores_vsr_batched(
+        self,
+        dataset,
+        joint_loader,
+        method,
+        weight,
+        threshold,
+        weight1,
+        weight2,
+        uncertainty_criterion="max_prob",
+        adapt_weighting="hard",
+        adapt_alpha=12.0,
+        adapt_span=0.1,
+        uncertainty_token_window=1,
+        uncertainty_token_agg="mean",
+        adjust_method="none",
+        region_config="",
+        low_random_th=-1.0,
+        random_mid_layers="14-25",
+        random_late_layers="26-31",
+        random_mid_range="0.02,0.12",
+        random_late_range="0.01,0.08",
+        ablate_head=-1,
+        ablate_head_weight=0.05,
+        ablate_head_layers="14-31",
+        active_heads="",
+        enable_nonsquare_scaling=False,
+        text_attn_scale=1.0,
+        image_attn_scale=1.0,
+        object_text_attn_scale=1.0,
+        top_flat_fraction=0.0,
+        top_flat_mix=0.0,
+    ):
         
         
         index = 0
@@ -480,6 +1027,7 @@ class LlavaWrapper:
         
         index_of_total = 0
         results = []
+        active_head_mask = _parse_active_heads(active_heads, num_heads=32)
 
         # Process each batch in the joint loader
         for batch in tqdm(joint_loader):
@@ -505,31 +1053,151 @@ class LlavaWrapper:
                         # Prepare input data for the model
                         single_input = self.processor(text=text, images=list(i_option)[idx], padding="max_length", return_tensors="pt", max_length=77).to(self.device)
                         keys = [torch.where(input_id == 32001, 1, 0) for input_id in single_input['input_ids']]
+                        object_keys = _build_object_token_mask(
+                            single_input["input_ids"],
+                            getattr(self.processor, "tokenizer", None),
+                            text,
+                        )
                         
                         # Apply different attention adjustment methods based on the 'method' argument
+                        head_weights = _build_head_weights(32, ablate_head, ablate_head_weight)
                         if method == 'scaling_vis':
                             change_greedy_to_add_weight()
-                            output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
-                            uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
+                            output = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight,
+                                adjust_method=adjust_method,
+                                layer_weights=None,
+                                head_weights=head_weights,
+                                head_apply_layers=ablate_head_layers,
+                                active_head_mask=active_head_mask,
+                                enable_nonsquare_scaling=enable_nonsquare_scaling,
+                                text_attn_scale=text_attn_scale,
+                                image_attn_scale=image_attn_scale,
+                                pos=object_keys,
+                                object_attn_scale=object_text_attn_scale,
+                                top_flat_fraction=top_flat_fraction,
+                                top_flat_mix=top_flat_mix,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+                            uncertainty = _compute_uncertainty(
+                                output['scores'],
+                                "max_prob",
+                                token_window=uncertainty_token_window,
+                                token_agg=uncertainty_token_agg,
+                            )
                             gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
                         
                         elif method == 'adapt_vis':
                             change_greedy_to_add_weight()
                             # Basic generation step
-                            output = self.model.generate(**single_input, weight=1.0,max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                            output = self.model.generate(
+                                **single_input,
+                                weight=1.0,
+                                adjust_method=adjust_method,
+                                head_weights=head_weights,
+                                head_apply_layers=ablate_head_layers,
+                                active_head_mask=active_head_mask,
+                                enable_nonsquare_scaling=enable_nonsquare_scaling,
+                                text_attn_scale=text_attn_scale,
+                                image_attn_scale=image_attn_scale,
+                                pos=object_keys,
+                                object_attn_scale=object_text_attn_scale,
+                                top_flat_fraction=top_flat_fraction,
+                                top_flat_mix=top_flat_mix,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
                             gen = self.processor.decode(output['sequences'][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
-                            uncertainty = np.round(float(max(output['scores'][0][0])), 2)
+                            uncertainty = _compute_uncertainty(
+                                output['scores'],
+                                uncertainty_criterion,
+                                token_window=uncertainty_token_window,
+                                token_agg=uncertainty_token_agg,
+                            )
+                            if os.getenv("LOG_TOP2_MARGIN", "0") == "1":
+                                _s = _compute_top2_margin_stats(
+                                    output['scores'],
+                                    token_window=uncertainty_token_window,
+                                    token_agg=uncertainty_token_agg,
+                                )
+                                print(
+                                    f"[top2_debug] top1={_s['top1']:.4f} top2={_s['top2']:.4f} margin={_s['margin']:.4f}"
+                                )
                             
                             # Apply weighted generation based on uncertainty
-                            if uncertainty < threshold:
-                                output = self.model.generate(**single_input, keys=keys, weight=weight1, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
-                            else:
-                                output = self.model.generate(**single_input, keys=keys, weight=weight2, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
+                            adapt_weight = _continuous_weight(
+                                uncertainty,
+                                threshold,
+                                weight1,
+                                weight2,
+                                mode=adapt_weighting,
+                                alpha=adapt_alpha,
+                                span=adapt_span,
+                            )
+                            region_layer_weights = _build_region_layer_weights(
+                                region_config=region_config,
+                                uncertainty=uncertainty,
+                                layer_count=32,
+                                low_random_th=low_random_th,
+                                random_mid_layers=random_mid_layers,
+                                random_late_layers=random_late_layers,
+                                random_mid_range=random_mid_range,
+                                random_late_range=random_late_range,
+                            )
+                            output = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=adapt_weight,
+                                adjust_method=adjust_method,
+                                layer_weights=region_layer_weights,
+                                head_weights=head_weights,
+                                head_apply_layers=ablate_head_layers,
+                                active_head_mask=active_head_mask,
+                                enable_nonsquare_scaling=enable_nonsquare_scaling,
+                                text_attn_scale=text_attn_scale,
+                                image_attn_scale=image_attn_scale,
+                                pos=object_keys,
+                                object_attn_scale=object_text_attn_scale,
+                                top_flat_fraction=top_flat_fraction,
+                                top_flat_mix=top_flat_mix,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
                             gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
 
                         else:
-                            output = self.model.generate(**single_input, keys=keys, weight=weight, max_new_tokens=100, output_scores=True, return_dict_in_generate=True)
-                            uncertainty = np.round(float(max(torch.nn.functional.softmax(output['scores'][0], dim=-1)[0])), 2)
+                            output = self.model.generate(
+                                **single_input,
+                                keys=keys,
+                                weight=weight,
+                                adjust_method=adjust_method,
+                                layer_weights=None,
+                                head_weights=head_weights,
+                                head_apply_layers=ablate_head_layers,
+                                active_head_mask=active_head_mask,
+                                enable_nonsquare_scaling=enable_nonsquare_scaling,
+                                text_attn_scale=text_attn_scale,
+                                image_attn_scale=image_attn_scale,
+                                pos=object_keys,
+                                object_attn_scale=object_text_attn_scale,
+                                top_flat_fraction=top_flat_fraction,
+                                top_flat_mix=top_flat_mix,
+                                max_new_tokens=100,
+                                output_scores=True,
+                                return_dict_in_generate=True,
+                            )
+                            uncertainty = _compute_uncertainty(
+                                output['scores'],
+                                "max_prob",
+                                token_window=uncertainty_token_window,
+                                token_agg=uncertainty_token_agg,
+                            )
                             gen = self.processor.decode(output[0][0][len(single_input['input_ids'][-1]):], skip_special_tokens=True, output_attentions=True)
                         
                         # Check correctness of the generated response
