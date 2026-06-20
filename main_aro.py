@@ -228,7 +228,7 @@ def main(args):
         if TEST==True:
             unsampled_indices = list(all_indices - set(sampled_indices))
             unsampled_indices.sort()
-            sampled_indices=unsampled_indices[:min(TEST_SAMPLE_COUNT, len(unsampled_indices))]
+            sampled_indices = unsampled_indices[:min(TEST_SAMPLE_COUNT, len(unsampled_indices))]
         sub_dataset = torch.utils.data.Subset(dataset, sampled_indices)
         joint_loader = DataLoader(sub_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
     #use full set

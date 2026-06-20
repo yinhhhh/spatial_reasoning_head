@@ -1,0 +1,56 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
+\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
+\global\let\oldcontentsline\contentsline
+\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
+\global\let\oldnewlabel\newlabel
+\gdef\newlabel#1#2{\newlabelxx{#1}#2}
+\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
+\AtEndDocument{\ifx\hyper@anchor\@undefined
+\let\contentsline\oldcontentsline
+\let\newlabel\oldnewlabel
+\fi}
+\fi}
+\global\let\hyper@last\relax 
+\gdef\HyperFirstAtBeginDocument#1{#1}
+\providecommand*\HyPL@Entry[1]{}
+\citation{liu2023llava,bai2023qwenvl}
+\citation{adaptvis}
+\HyPL@Entry{0<</S/D>>}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\citation{vaswani2017attention}
+\citation{liu2023llava,bai2023qwenvl}
+\citation{adaptvis}
+\citation{redmon2016yolo}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Preliminaries}{2}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Head-Level Spatial Analysis}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Head-wise attention distribution (YOLO overlap)}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces 32-head qualitative comparison on a representative controlled sample (layer 17).}}{3}{figure.1}\protected@file@percent }
+\newlabel{fig:head32}{{1}{3}{32-head qualitative comparison on a representative controlled sample (layer 17)}{figure.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Per-head overlap on \texttt  {Controlled\_Images\_A} under the single-box protocol (heads ranked by overlap; top-8 highlighted).}}{4}{figure.2}\protected@file@percent }
+\newlabel{fig:singlebox_overlap}{{2}{4}{Per-head overlap on \texttt {Controlled\_Images\_A} under the single-box protocol (heads ranked by overlap; top-8 highlighted)}{figure.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}AUROC-based functional ranking}{4}{subsection.3.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Inverse relation between overlap and AUROC across heads (top-8 overlap vs top-8 AUROC groups).}}{4}{figure.3}\protected@file@percent }
+\newlabel{fig:inverse_relation}{{3}{4}{Inverse relation between overlap and AUROC across heads (top-8 overlap vs top-8 AUROC groups)}{figure.3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Two-line view of inverse relation: heads are sorted by overlap (small to large), while overlap (blue) and AUROC (orange) are plotted on the same head order.}}{5}{figure.4}\protected@file@percent }
+\newlabel{fig:inverse_line}{{4}{5}{Two-line view of inverse relation: heads are sorted by overlap (small to large), while overlap (blue) and AUROC (orange) are plotted on the same head order}{figure.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Our Method: Function-Aware Spatial Attention Reallocation}{5}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Margin-Guided Continuous Reallocation}{5}{subsection.4.1}\protected@file@percent }
+\bibstyle{plainnat}
+\bibdata{references}
+\bibcite{adaptvis}{{1}{2026}{{Anonymous}}{{}}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Experimental Results}{6}{subsection.4.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Accuracy comparison on four datasets (100-sample view).}}{6}{table.1}\protected@file@percent }
+\newlabel{tab:four_dataset_main}{{1}{6}{Accuracy comparison on four datasets (100-sample view)}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Conclusion}{6}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {A}Failure Case Discussion}{6}{appendix.A}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {B}Best Hyperparameter Selection (100-sample)}{6}{appendix.B}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Best hyperparameters selected from 100-sample tuning.}}{6}{table.2}\protected@file@percent }
+\newlabel{tab:best_hparams_100}{{2}{6}{Best hyperparameters selected from 100-sample tuning}{table.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {C}Appendix: Naive-Idea Evaluation (TODO)}{6}{appendix.C}\protected@file@percent }
+\bibcite{bai2023qwenvl}{{2}{2023}{{Bai et~al.}}{{Bai, Bai, Yang, Wang, Tan, Wang, Li, Hu, Ren, Zhang, Zhou, Ge, Lin, Sun, Chen, Li, Guo, Ding, Zhang, Li, Li, Liu, Zhu, Ma, and Qiu}}}
+\bibcite{liu2023llava}{{3}{2023}{{Liu et~al.}}{{Liu, Li, Wu, and Lee}}}
+\bibcite{redmon2016yolo}{{4}{2016}{{Redmon et~al.}}{{Redmon, Divvala, Girshick, and Farhadi}}}
+\bibcite{vaswani2017attention}{{5}{2017}{{Vaswani et~al.}}{{Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez, Kaiser, and Polosukhin}}}
+\gdef \@abspage@last{7}

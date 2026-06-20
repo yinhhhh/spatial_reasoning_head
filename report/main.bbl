@@ -1,0 +1,45 @@
+\begin{thebibliography}{5}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Anonymous(2026)]{adaptvis}
+Anonymous.
+\newblock Adaptvis: Adaptive attention reweighting for visual reasoning in
+  multimodal language models.
+\newblock \emph{arXiv preprint arXiv:XXXX.XXXXX}, 2026.
+\newblock Please replace with the exact bibliographic entry.
+
+\bibitem[Bai et~al.(2023)Bai, Bai, Yang, Wang, Tan, Wang, Li, Hu, Ren, Zhang,
+  Zhou, Ge, Lin, Sun, Chen, Li, Guo, Ding, Zhang, Li, Li, Liu, Zhu, Ma, and
+  Qiu]{bai2023qwenvl}
+Jinze Bai, Shuai Bai, Shusheng Yang, Shugang Wang, Siling Tan, Ke~Wang, Xinhui
+  Li, Rulin Hu, Dian Ren, Xia Zhang, Chuan Zhou, Wen Ge, Junyang Lin, Yichang
+  Sun, Junsong Chen, Jiaxuan Li, Guosheng Guo, Nan Ding, Yujia Zhang, Xuan Li,
+  Dayiheng Li, Tianyu Liu, Jun Zhu, Yi~Ma, and Xipeng Qiu.
+\newblock Qwen-vl: A frontier large vision-language model with versatile
+  abilities.
+\newblock \emph{arXiv preprint arXiv:2308.12966}, 2023.
+
+\bibitem[Liu et~al.(2023)Liu, Li, Wu, and Lee]{liu2023llava}
+Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong~Jae Lee.
+\newblock Visual instruction tuning.
+\newblock \emph{arXiv preprint arXiv:2304.08485}, 2023.
+
+\bibitem[Redmon et~al.(2016)Redmon, Divvala, Girshick, and
+  Farhadi]{redmon2016yolo}
+Joseph Redmon, Santosh Divvala, Ross Girshick, and Ali Farhadi.
+\newblock You only look once: Unified, real-time object detection.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and
+  Pattern Recognition}, pages 779--788, 2016.
+
+\bibitem[Vaswani et~al.(2017)Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez,
+  Kaiser, and Polosukhin]{vaswani2017attention}
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+  Aidan~N. Gomez, Lukasz Kaiser, and Illia Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2017.
+
+\end{thebibliography}
