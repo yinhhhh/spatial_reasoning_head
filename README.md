@@ -1,66 +1,144 @@
-# Why Is Spatial Reasoning Hard for VLMs? An Attention Mechanism Perspective on Focus Areas
+# AdaptVis Spatial Reasoning Experiments
 
-Code and datasets for **Why Is Spatial Reasoning Hard for VLMs? An Attention Mechanism Perspective on Focus Areas** [[paper](https://arxiv.org/pdf/2503.01773)].
+This repository contains the code, analysis scripts, and report assets for our NeurIPS-style write-up on head-level spatial reasoning in VLMs.
 
+Repository URL: [https://github.com/yinhhhh/spatial_reasoning_head](https://github.com/yinhhhh/spatial_reasoning_head)
 
-This code is based on the code of, **What's "up" with vision-language models? Investigating their struggle with spatial reasoning** [[paper](https://arxiv.org/pdf/2310.19785)][[code](https://github.com/amitakamath/whatsup_vlms)].
+## What This Repo Reproduces
 
-<p align="center">
-<img src="figures/main.png" width="800">
-</p>
+The report follows a mechanism-to-method story:
 
+1. **Head diagnosis**: measure per-head YOLO-region overlap and overlap-to-correctness AUROC.
+2. **Naive intervention check**: direct in-box boosting is unstable.
+3. **Improved method**: margin-guided continuous attention reallocation for better spatial reasoning.
 
-# Datasets
- The code to load and evaluate each dataset in `dataset_zoo/aro_datasets.py`. The Question and Answering data is in `prompt/`.
+## Environment Setup
 
-# Method: ScalingVis and AdaptVis
-
-## Setting Up the environment
-
-```
-git clone https://github.com/shiqichen17/AdaptVis.git
-mkdir data
-mkdir output
-pip install -r requirements.txt
+```bash
+git clone https://github.com/yinhhhh/spatial_reasoning_head.git
+cd spatial_reasoning_head
+python3 -m pip install -r requirements.txt
+mkdir -p data output outputs
 ```
 
-## Downloading the data
-The data all lives in `whatsup_vlms/data`, which is also where your models will go as they're downloaded.   
+Optional (if your environment needs mirror endpoints):
 
-For all the datasets, setting `--download=True` (while running `python main_aro.py` or while instantiating the dataset directly, as mentioned later in this README) will download the data JSONs and images if the files don't already exist.
-
-You can also download the data directly from [this Google Drive link](https://drive.google.com/drive/u/3/folders/164q6X9hrvP-QYpi3ioSnfMuyHpG5oRkZ).
-Alternatively, you can download from HuggingFace datasets [here](https://huggingface.co/datasets/AdaptVis/all_datasets).
-
-
-## Running experiments scaling_vis and adapt_vis
-You can fast implement an example by:
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+export HUGGINGFACE_HUB_ENDPOINT=https://hf-mirror.com
 ```
-bash run.sh
-```
-### Argument
-All parameter choices are indicated in `run.sh`.
-| Argument       | Example               | Description                                                                                   |
-|----------------|-----------------------|-----------------------------------------------------------------------------------------------|
-| `dataset`          | `Controlled_Images_A` | Specifies the dataset you want to evaluate. Can choose from `Controlled_Images_A, Controlled_Images_B..`. |
-| `model`              | `llava1.5`            | Specifies the model you want to use.                                                          |
-| `method`                | `scaling_vis`         | The method for evaluation. Can choose from `"scaling_vis"` or `"adapt_vis"`.                  |
-| `weight`                   | `1.2`                 | Coefficient for Scaling_vis. Can set from `[0, 0.5, 0.8, 1.2, 1.5, 2.0]`.                       |
-| `weight1`           | `0.5`                 | Coefficient for AdaptVis. Can set from `[0.5, 0.8]`.                                          |
-| `weight2`          | `1.2`                 | Coefficient for AdaptVis. Can set from `[1.2, 1.5, 2.0]`.                                     |
-| `threshold`                 | `0.3`                 | Threshold for AdaptVis.                                                                        |
 
+## Data
 
-# Citation
-If you use this code or data, please consider citing our paper:
+- Dataset loading and evaluation logic: `dataset_zoo/aro_datasets.py`
+- QA prompts: `prompt/`
+- `main_aro.py --download` will auto-download required dataset files if missing.
+
+## Core Experiment Commands
+
+Set 100-sample test mode:
+
+```bash
+export TEST_MODE=True
+export TEST_SAMPLE_COUNT=100
 ```
-@misc{chen2025spatialreasoninghardvlms,
-      title={Why Is Spatial Reasoning Hard for VLMs? An Attention Mechanism Perspective on Focus Areas}, 
-      author={Shiqi Chen and Tongyao Zhu and Ruochen Zhou and Jinghan Zhang and Siyang Gao and Juan Carlos Niebles and Mor Geva and Junxian He and Jiajun Wu and Manling Li},
-      year={2025},
-      eprint={2503.01773},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2503.01773}, 
-}
+
+Run a baseline example:
+
+```bash
+python3 main_aro.py \
+  --dataset Controlled_Images_A \
+  --model-name llava1.5 \
+  --download \
+  --method base \
+  --option four \
+  --output-dir outputs/control_image_a_base_100
 ```
+
+Run an AdaptVis-style baseline configuration:
+
+```bash
+python3 main_aro.py \
+  --dataset Controlled_Images_A \
+  --model-name llava1.5 \
+  --download \
+  --method adapt_vis \
+  --weight1 0.5 \
+  --weight2 1.5 \
+  --threshold 0.4 \
+  --option four \
+  --output-dir outputs/control_image_a_adaptvis_100
+```
+
+Batch scripts used in our experiments:
+
+- `run.sh`
+- `tools/run_newmethod_headsplit_100.sh`
+- `tools/run_best6_selected16_100.sh`
+- `tools/run_best6_allhead_image12_100.sh`
+- `tools/run_other16_bestcfg_100.sh`
+
+## Multi-Head YOLO Overlap and AUROC
+
+General 4-dataset analyzer:
+
+```bash
+python3 tools/analyze_head_overlap_auroc.py \
+  --dataset-name Controlled_Images_A \
+  --attn-dir output/Controlled_Images_A_weight1.00 \
+  --result-jsonl outputs/control_image_a_adaptvis_100/res.json \
+  --sample-count 100 \
+  --layer 17 \
+  --yolo-model yolov8n.pt \
+  --output-dir outputs/head_verify_margin_continuous/control_a_margin_sigmoid_head_analysis \
+  --title-prefix Controlled_Images_A
+```
+
+Controlled_Images_A dedicated analyzer:
+
+```bash
+python3 tools/analyze_control_image_a_heads.py \
+  --attn-dir output/Controlled_Images_A_weight1.00 \
+  --result-jsonl outputs/control_image_a_adaptvis_100/res.json \
+  --sample-count 100 \
+  --layer 17 \
+  --yolo-model yolov8n.pt \
+  --output-dir outputs/head_verify_4runs/control_a_baseline_head_analysis
+```
+
+The scripts export:
+
+- `head_overlap_bar.png`
+- `head_auroc_bar.png`
+- `summary.json`
+
+## Report Build
+
+```bash
+cd report
+latexmk main.tex
+```
+
+Main report files:
+
+- `report/main.tex`
+- `report/references.bib`
+- `report/figures/`
+
+## Source Code Reference
+
+For code review and method tracing, start from:
+
+- `main_aro.py` (entry point)
+- `model_zoo/llava15.py` (model wrapper / decoding flow)
+- `model_zoo/llava/modeling_llava_scal.py` (image attention intervention path)
+- `model_zoo/llama/modeling_llama_add_attn.py` (attention/head-level modifications)
+- `tools/analyze_head_overlap_auroc.py` (per-head overlap + AUROC)
+- `tools/eval_yolo_attention_overlap.py` (YOLO overlap comparison and visual diagnostics)
+
+## Base Acknowledgement
+
+This project is built on top of prior open-source work from:
+
+- What's "up" with vision-language models? [[paper](https://arxiv.org/pdf/2310.19785)] [[code](https://github.com/amitakamath/whatsup_vlms)]
+
