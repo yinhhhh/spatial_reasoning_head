@@ -1,20 +1,17 @@
 # CV Course Project: Head-Level Spatial Reasoning in VLMs
 
-This repository contains the code, analysis scripts, and report assets for our computer vision course project on head-level spatial reasoning in VLMs.
+This repository contains the code, analysis tools and scripts for our computer vision course project on head-level spatial reasoning in VLMs.
 
-Repository URL: [https://github.com/yinhhhh/spatial_reasoning_head](https://github.com/yinhhhh/spatial_reasoning_head)
+Our project follows a mechanism-to-method story:
 
-We strongly recommend you to read our report first.
+1. **Head diagnosis**: measure per-head YOLO-region overlap and overlap-to-correctness AUROC.
+2. **Improved method**: margin-guided continuous attention reallocation for better spatial reasoning.
 
-## Teaser Figures
-
-### Inverse Relation Between Overlap and AUROC
+![Sample-0 32-head visualization](readme_teaser/head32_llava15_baseline_sample0.png)
 
 ![Inverse relation line plot](readme_teaser/head_overlap_sorted_dual_line.png)
 
-### Layer-17 Head Attention Grid (Sample 0)
-
-![Sample-0 32-head visualization](readme_teaser/head32_llava15_baseline_sample0.png)
+We strongly recommend you to read our report first.
 
 ## Acknowledgement
 
@@ -22,12 +19,6 @@ This project is based on the AdaptVis codebase. We thank the original authors fo
 
 - AdaptVis original project: [https://github.com/shiqichen17/AdaptVis](https://github.com/shiqichen17/AdaptVis)
 
-## What This Repo Reproduces
-
-The report follows a mechanism-to-method story:
-
-1. **Head diagnosis**: measure per-head YOLO-region overlap and overlap-to-correctness AUROC.
-2. **Improved method**: margin-guided continuous attention reallocation for better spatial reasoning.
 
 ## Data
 
