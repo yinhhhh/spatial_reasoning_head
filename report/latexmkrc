@@ -1,7 +1,0 @@
-$pdf_mode = 5;  # XeLaTeX -> xdv -> PDF
-$xelatex = 'xelatex -interaction=nonstopmode -file-line-error %O %S';
-$bibtex = 'bibtex %O %B';
-
-# Keep outputs in report/ for easy preview
-$out_dir = '.';
-$aux_dir = '.';
