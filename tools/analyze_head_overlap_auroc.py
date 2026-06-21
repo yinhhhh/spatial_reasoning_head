@@ -18,6 +18,7 @@ def parse_args():
         required=True,
         choices=[
             "Controlled_Images_A",
+            "Controlled_Images_B",
             "COCO_QA_one_obj",
             "COCO_QA_two_obj",
             "VG_QA_one_obj",
@@ -58,6 +59,9 @@ def load_last_json(path: Path):
 def load_image_paths(dataset_name: str):
     if dataset_name == "Controlled_Images_A":
         records = json.loads(Path("data/controlled_images_dataset.json").read_text(encoding="utf-8"))
+        return [r["image_path"] for r in records]
+    if dataset_name == "Controlled_Images_B":
+        records = json.loads(Path("data/controlled_clevr_dataset.json").read_text(encoding="utf-8"))
         return [r["image_path"] for r in records]
     if dataset_name == "COCO_QA_one_obj":
         records = json.loads(Path("data/coco_qa_one_obj.json").read_text(encoding="utf-8"))

@@ -10,6 +10,7 @@ def get_model(model_name, device, method='base',root_dir='data'):
     """
     Helper function that returns a model and a potential image preprocessing function.
     """
+    root_dir = os.getenv("MODEL_CACHE_DIR", root_dir)
     if "openai-clip" in model_name:
         from .clip_models import CLIPWrapper
         variant = model_name.split(":")[1]

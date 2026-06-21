@@ -1,0 +1,40 @@
+[
+  {
+    "local_sample_idx": 0,
+    "global_dataset_idx": 0,
+    "image_path": "data/controlled_images/beer-bottle_on_armchair.jpeg",
+    "num_boxes": 2,
+    "boxes_xyxy": [
+      [
+        392.61993408203125,
+        402.9031982421875,
+        890.3632202148438,
+        912.6146240234375
+      ],
+      [
+        627.5276489257812,
+        491.5477600097656,
+        669.6937866210938,
+        621.9498291015625
+      ]
+    ],
+    "box_classes": [
+      "chair",
+      "bottle"
+    ],
+    "box_confs": [
+      0.859088659286499,
+      0.581902027130127
+    ],
+    "patch_grid_side": 24,
+    "box_patch_coverage_ratio": 0.22569444444444445,
+    "box_expand_ratio": 0.0,
+    "overlap_max_prob": 0.22574341297149658,
+    "overlap_margin": 0.22574341297149658,
+    "margin_minus_max": 0.0,
+    "new_adaptive_lambda": 0.0,
+    "new_top_fraction": 0.0,
+    "new_top_mix": 1.0,
+    "new_top_equalized_count": 0
+  }
+]

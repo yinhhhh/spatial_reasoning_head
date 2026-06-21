@@ -570,8 +570,10 @@ def change_greedy_to_add_weight():
 
 class LlavaWrapper:
     def __init__(self, root_dir, device,method):
-        
-        if method=='scaling_vis' or method=='adapt_vis':
+        force_scal_for_base = os.getenv("FORCE_SCAL_FOR_BASE_DUMP", "0") == "1"
+        use_scal = method in {"scaling_vis", "adapt_vis"} or (method == "base" and force_scal_for_base)
+
+        if use_scal:
             self.model = LlavaForConditionalGenerationScal.from_pretrained(MODEL, revision='a272c74',cache_dir=root_dir,ignore_mismatched_sizes=True).eval().to(device)
 
         else:
@@ -714,7 +716,7 @@ class LlavaWrapper:
             answer_list = [answer_list[i] for i in sampled_indices]
 
         # Create directory for saving attention maps
-        save_attn_dir = f"./output/{dataset}_weight{weight:.2f}"
+        save_attn_dir = os.getenv("SAVE_ATTN_DIR", f"./output/{dataset}_weight{weight:.2f}")
         os.makedirs(save_attn_dir, exist_ok=True)
         active_head_mask = _parse_active_heads(active_heads, num_heads=32)
 
@@ -873,7 +875,8 @@ class LlavaWrapper:
                     else:
                         # Default generation method
                         supports_custom_attention = "Scal" in str(type(self.model))
-                        if supports_custom_attention and (text_attn_scale != 1.0 or image_attn_scale != 1.0):
+                        force_base_dump = os.getenv("FORCE_BASE_ATTN_DUMP", "0") == "1"
+                        if supports_custom_attention and (text_attn_scale != 1.0 or image_attn_scale != 1.0 or force_base_dump):
                             change_greedy_to_add_weight()
                             output = self.model.generate(
                                 **single_input,
@@ -1020,7 +1023,10 @@ class LlavaWrapper:
         TP, TN, FP, FN = 0, 0, 0, 0
 
         # Set the directory to save attention maps
-        save_attn_dir = f"/home/user/shiqi/mmlm_mech/whatsup_vlms/outputs/{dataset}_weight{weight:.2f}"
+        save_attn_dir = os.getenv(
+            "SAVE_ATTN_DIR",
+            f"/home/user/shiqi/mmlm_mech/whatsup_vlms/outputs/{dataset}_weight{weight:.2f}",
+        )
         if not os.path.exists(save_attn_dir):
             print("Creating directory for saving attention maps:", save_attn_dir)
             os.makedirs(save_attn_dir)
